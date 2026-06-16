@@ -14,7 +14,6 @@ app = FastAPI(
     version="1.2.0"
 )
 
-# Configuración de CORS para conectar de forma segura con React
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- CONTADORES EN MEMORIA PARA EL DASHBOARD DINÁMICO ---
+# CONTADORES EN MEMORIA
 estadisticas_operativas = {
     "total_evaluaciones": 0,
     "aprobados": 0,
@@ -36,9 +35,8 @@ estadisticas_operativas = {
 BUCKET_NAME = "am-up-01-credit-riskv2"
 PROJECT_ID = "cloud-computing-jm-2026v2"
 LOCATION = "us-central1"
-ENDPOINT_ID = "6078901272566562816"  # ID de tu Endpoint activo
+ENDPOINT_ID = "6078901272566562816"
 
-# Inicializar el SDK de Google Cloud AI Platform de manera global
 aiplatform.init(project=PROJECT_ID, location=LOCATION)
 
 
@@ -48,25 +46,14 @@ aiplatform.init(project=PROJECT_ID, location=LOCATION)
 
 @app.get("/")
 def root():
-    """
-    Ruta raíz para el Health Check del contenedor en Cloud Run.
-    """
     return {
         "status": "online", 
         "architecture": "event-driven-mlops-async",
-        "message": "Backend conectado y optimizado contra timeouts de navegador"
+        "message": "Backend conectado y optimizado"
     }
 
-
-# ------------------------------------------------------------------------------
-# ENDPOINT NUEVO: Consulta de Métricas en Tiempo Real para el Dashboard
-# ------------------------------------------------------------------------------
 @app.get("/metrics/")
 def obtener_metricas():
-    """
-    Calcula dinámicamente los porcentajes de aprobación e impago 
-    acumulados durante la sesión operativa actual para alimentar el Front.
-    """
     total = estadisticas_operativas["total_evaluaciones"]
     if total == 0:
         return {"pct_aprobados": 0, "pct_rechazados": 0, "total": 0}
@@ -80,27 +67,80 @@ def obtener_metricas():
         "total": total
     }
 
-
 # ------------------------------------------------------------------------------
-# ENDPOINT 1: Carga de CSV (Detonador del evento de re-entrenamiento)
+# ENDPOINT NUEVO: Leer predicciones generadas por el proceso por lotes desde GCS
 # ------------------------------------------------------------------------------
-@app.post("/upload-csv/")
-async def upload_csv(file: UploadFile = File(...)):
+@app.get("/batch-results/")
+def obtener_resultados_batch():
     """
-    Recibe el nuevo archivo 'loan.csv'. Al guardarlo en 'data/raw/', 
-    GCP detecta el evento y dispara automáticamente el pipeline de re-entrenamiento.
+    Busca de manera dinámica el archivo 'prediction.results' más reciente
+    dentro de la estructura de carpetas de batch_outputs en Cloud Storage.
     """
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="El archivo debe ser un formato CSV válido.")
-    
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         
-        # Guardar en la ruta raw que vigila tu disparador de Vertex AI
+        # Listar objetos con el prefijo donde Vertex AI deposita las respuestas
+        blobs = bucket.list_blobs(prefix="batch_outputs/")
+        
+        # Filtrar para encontrar el archivo de resultados real generado
+        target_blob = None
+        for blob in blobs:
+            if "prediction.results-" in blob.name:
+                target_blob = blob
+                # No rompemos el ciclo para asegurarnos de agarrar el último subido
+        
+        if not target_blob:
+            return {"status": "no_files", "results": [], "message": "No se encontraron archivos de resultados procesados aún."}
+            
+        # Descargar el contenido JSON Lines en memoria
+        content = target_blob.download_as_text()
+        lineas = content.splitlines()
+        
+        parsed_results = []
+        for index, line in enumerate(lineas):
+            if not line.strip():
+                continue
+            data = json.loads(line)
+            
+            # Ajustar según la estructura exacta que arroja tu modelo XGBoost entrenado con Optuna
+            # Usualmente viene como {"prediction": [score], "label": [0]} o similar
+            instance_data = data.get("instance", {})
+            prediction_data = data.get("prediction", {})
+            
+            # Vertex AI Batch suele retornar las clases en llaves como 'label' o la primera posición de un array
+            clase = int(prediction_data[0] if isinstance(prediction_data, list) else prediction_data.get("label", 0))
+            probabilidad = float(prediction_data[1] if isinstance(prediction_data, list) else prediction_data.get("probability", 0.0))
+            
+            parsed_results.append({
+                "id": index + 1,
+                "monto_solicitado": instance_data.get("loan_amnt", "N/A"),
+                "proposito": instance_data.get("purpose", "N/A"),
+                "probabilidad_default": round(probabilidad * 100, 2) if probabilidad <= 1 else probabilidad,
+                "dictamen": "Rechazado (Riesgo Alto)" if clase == 1 else "Aprobado (Riesgo Bajo)",
+                "clase": clase
+            })
+            
+        return {
+            "status": "success",
+            "archivo_origen": target_blob.name,
+            "results": parsed_results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al leer resultados desde GCS: {str(e)}")
+
+# ------------------------------------------------------------------------------
+# ENDPOINTS PREVIOS (UPLOAD CSV, SINGLE PREDICT Y BATCH PREDICT)
+# ------------------------------------------------------------------------------
+@app.post("/upload-csv/")
+async def upload_csv(file: UploadFile = File(...)):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="El archivo debe ser un formato CSV válido.")
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(f"data/raw/{file.filename}")
         blob.upload_from_file(file.file, content_type=file.content_type)
-        
         return {
             "status": "success",
             "message": f"Archivo '{file.filename}' depositado en el Storage.",
@@ -110,19 +150,10 @@ async def upload_csv(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en Cloud Storage: {str(e)}")
 
-
-# ------------------------------------------------------------------------------
-# ENDPOINT 2: Predicción Individual en Línea (Formulario de React)
-# ------------------------------------------------------------------------------
 @app.post("/predict-single/")
 async def predict_single(data: dict):
-    """
-    Recibe las 23 variables del formulario, consulta al endpoint fijo de Vertex AI,
-    actualiza los indicadores acumulados de la sesión y retorna la predicción oficial.
-    """
     try:
         endpoint = aiplatform.Endpoint(endpoint_name=ENDPOINT_ID)
-        
         cliente_instancia = {
             "loan_amnt": int(data.get("loan_amnt", 0)),
             "term": str(data.get("term", " 36 months")),
@@ -148,14 +179,11 @@ async def predict_single(data: dict):
             "pub_rec_bankruptcies": int(data.get("pub_rec_bankruptcies", 0)),
             "tax_liens": int(data.get("tax_liens", 0))
         }
-        
         response = endpoint.predict(instances=[cliente_instancia])
-        
         primera_prediccion = response.predictions[0]
         clase = int(primera_prediccion.get("label"))              
         probabilidad = float(primera_prediccion.get("probability"))  
         
-        # --- ENLACE DINÁMICO: ACTUALIZACIÓN DE CONTADORES EN BASE A VERTEX AI ---
         estadisticas_operativas["total_evaluaciones"] += 1
         if clase == 0:
             estadisticas_operativas["aprobados"] += 1
@@ -171,56 +199,33 @@ async def predict_single(data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en Vertex AI Online: {str(e)}")
 
-
-# ------------------------------------------------------------------------------
-# ENDPOINT 3: Predicción Masiva por Lotes (CORREGIDO PARA XGBOOST / JSONL)
-# ------------------------------------------------------------------------------
 @app.post("/predict-batch/")
 async def predict_batch(file: UploadFile = File(...)):
-    """
-    Recibe un CSV masivo, lo transforma automáticamente a JSON Lines (formato exigido por XGBoost)
-    y agenda la tarea asíncrona en Vertex AI evitando el fallo de strings.
-    """
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Debes cargar un archivo CSV válido para el lote.")
-        
     try:
-        # 1. Leer el archivo CSV cargado y convertirlo a formato JSON Lines
         contents = await file.read()
         lines = contents.decode("utf-8").splitlines()
-        
         if len(lines) < 2:
-            raise HTTPException(status_code=400, detail="El archivo CSV está vacío o le faltan filas de datos.")
+            raise HTTPException(status_code=400, detail="El archivo CSV está vacío.")
             
-        # Extraer los encabezados de las columnas
         headers = [h.strip() for h in lines[0].split(",")]
-        
-        # Construir el contenido del archivo .jsonl en memoria
         jsonl_lines = []
         for line in lines[1:]:
             if not line.strip():
                 continue
             values = [v.strip() for v in line.split(",")]
-            
-            # Crear el diccionario mapeando las 23 variables
             row_dict = {}
             for header, val in zip(headers, values):
-                # Castear tipos de datos básicos para que XGBoost no truene
                 if val.replace('.', '', 1).isdigit():
                     row_dict[header] = float(val) if '.' in val else int(val)
                 else:
-                    row_dict[header] = val.replace('"', '') # Limpiar comillas extras
-                    
+                    row_dict[header] = val.replace('"', '')
             jsonl_lines.append(json.dumps(row_dict))
             
-        # Unir todas las líneas con saltos de línea para estructurar el archivo .jsonl
         jsonl_content = "\n".join(jsonl_lines)
-        
-        # 2. Subir el archivo transformado (.jsonl) a Cloud Storage
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
-        
-        # Cambiamos el nombre de la extensión para reflejar el nuevo formato
         filename_base = file.filename.rsplit('.', 1)[0]
         jsonl_filename = f"{filename_base}.jsonl"
         
@@ -230,17 +235,14 @@ async def predict_batch(file: UploadFile = File(...)):
         gcs_input_uri = f"gs://{BUCKET_NAME}/batch_inputs/{jsonl_filename}"
         gcs_output_uri_prefix = f"gs://{BUCKET_NAME}/batch_outputs/"
         
-        # 3. Resolución dinámica del ID del Modelo activo en el Endpoint fijo
         endpoint = aiplatform.Endpoint(endpoint_name=ENDPOINT_ID)
         modelos_desplegados = endpoint.list_models()
-        
         if not modelos_desplegados:
-            raise Exception("El Endpoint no cuenta con ningún modelo desplegado en producción en este momento.")
+            raise Exception("El Endpoint no cuenta con ningún modelo desplegado.")
         
         model_id_dinamico = modelos_desplegados[0].model
         model = aiplatform.Model(model_name=model_id_dinamico)
         
-        # 4. Disparar el Job en Vertex AI indicando que ahora la entrada es "jsonl"
         batch_job = model.batch_predict(
             job_display_name=f"batch_scoring_dynamic_{filename_base}",
             gcs_source=gcs_input_uri,
@@ -250,13 +252,12 @@ async def predict_batch(file: UploadFile = File(...)):
             machine_type="n1-standard-4",
             sync=False
         )
-        
         return {
             "tipo_prediccion": "lote_masivo",
             "status": "Trabajo de predicción masiva enviado con éxito a Vertex AI",
             "modelo_utilizado_id": model_id_dinamico,
             "job_id": batch_job.name,
-            "mensaje": "Se convirtió el CSV a JSON Lines automáticamente. Monitorea el progreso en tu consola web.",
+            "mensaje": "Se convirtió el CSV a JSON Lines automáticamente.",
             "input_origen": gcs_input_uri,
             "carpeta_destino_resultados": gcs_output_uri_prefix
         }
