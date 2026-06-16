@@ -3,3 +3,4 @@ uvicorn==0.30.*
 google-cloud-storage==2.14.*
 google-cloud-aiplatform==1.36.*
 python-multipart==0.0.9
+setuptools==69.5.1
